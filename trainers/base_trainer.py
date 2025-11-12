@@ -46,6 +46,7 @@ class BaseTrainer:
         self.world_size = world_size
         self.local_rank = local_rank
         self.device: str = "cpu" if world_size == 0 else f"cuda:{local_rank}"
+        self.best_psnr_for_saving = None
 
         # if ckpt_path is not None:
         #     if os.path.isdir(ckpt_path):
@@ -66,12 +67,9 @@ class BaseTrainer:
         self._model = self.get_model()
         self._model.to(self.device)
         if self.world_size > 1:
-            self._model = cast(
-                nn.Module,
-                DDP(self._model, device_ids=[local_rank], find_unused_parameters=True),
-            )
+            self._model = DDP(self._model, device_ids=[local_rank], find_unused_parameters=False)
+            CONSOLE.print("DDP initialized")
             dist.barrier(device_ids=[local_rank])
-        print(f"Model trainable parameters: {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,}")
 
         self.setup_modules()
 
@@ -91,7 +89,7 @@ class BaseTrainer:
     def model(self) -> nn.Module:
         """Returns the unwrapped model if in ddp"""
         if isinstance(self._model, DDP):
-            return cast(nn.Module, self._model.module)
+            return self._model.module
         return self._model
 
     def setup_dataloader(self):
@@ -115,7 +113,6 @@ class BaseTrainer:
     def train(self):
         self._model.train()
 
-        # for step_idx in tqdm(range(self._start_step, self._start_step + num_iterations), desc="Training"):
         step_idx = 0
         num_epoch = self.config.TRAIN.num_epochs
         grad_acc = self.config.TRAIN.grad_acc
@@ -265,6 +262,11 @@ class BaseTrainer:
         self.load_timer = Timer()
         self.inference_timer = Timer()
 
+    def get_all_model_state_dict(self):
+        return {
+            "model": self.model.state_dict(),
+        }
+
     @check_main_thread
     def save_checkpoint(self, step_idx: int, metrics_dict: Dict[str, float]) -> None:
         """Save the model and optimizers
@@ -279,17 +281,24 @@ class BaseTrainer:
         ckpt_path: Path = checkpoint_dir / f"step-{step_idx:09d}.ckpt"
         checkpoint = {
             "step": step_idx,
-            "model": self.model.state_dict(),
+            **self.get_all_model_state_dict(),
         }
         if hasattr(self, "optimizer"):
             checkpoint["optimizer"] = self.optimizer.state_dict()
         torch.save(checkpoint, ckpt_path)
         CONSOLE.print(f"Saved checkpoint to {ckpt_path}")
+
+        best_ckpt_path = checkpoint_dir / "best.ckpt"
+        if self.best_psnr_for_saving is None or metrics_dict["psnr"] > self.best_psnr_for_saving:
+            self.best_psnr_for_saving = metrics_dict["psnr"]
+            CONSOLE.print(f"New best PSNR: {self.best_psnr_for_saving:.4f}, saving to {best_ckpt_path}")
+            torch.save(checkpoint, best_ckpt_path)
+
         # possibly delete old checkpoints
         if self.config.save_only_latest_checkpoint:
             # delete everything else in the checkpoint folder
             for f in checkpoint_dir.glob("*"):
-                if f != ckpt_path:
+                if f != ckpt_path and f != best_ckpt_path:
                     f.unlink()
 
     def load_checkpoint(self, ckpt_path: str) -> None:
