@@ -120,3 +120,51 @@ def save_depth_opencv(
     color_map = cv2.applyColorMap(depth_map, colormap)  # Apply colormap
     cv2.imwrite(str(save_path), color_map)
     return color_map
+
+
+def save_depth_visualization(
+    depth_map,
+    save_path,
+    colormap=cv2.COLORMAP_VIRIDIS,
+    normalize=True,
+):
+    """
+    Saves a human-readable visualization of a depth map with colormap applied.
+    
+    Parameters:
+        depth_map (numpy.ndarray or torch.Tensor): Grayscale depth map (2D array).
+        save_path (str or Path): Path where the visualization should be saved.
+        colormap (int): OpenCV colormap (default is COLORMAP_VIRIDIS).
+        normalize (bool): Whether to normalize depth values to 0-255.
+    
+    Returns:
+        numpy.ndarray: Colorized depth map (BGR image).
+    """
+    if isinstance(depth_map, torch.Tensor):
+        depth_map = depth_map.squeeze().cpu().numpy()
+    
+    # Handle 2D array
+    if len(depth_map.shape) == 2:
+        depth_normalized = depth_map.copy()
+    # Handle concatenated depth maps (side by side)
+    elif len(depth_map.shape) == 3 and depth_map.shape[0] == 1:
+        depth_normalized = depth_map.squeeze(0)
+    else:
+        depth_normalized = depth_map
+    
+    if normalize:
+        # Mask out invalid depth values (0 or inf)
+        valid_mask = (depth_normalized > 0) & np.isfinite(depth_normalized)
+        if valid_mask.any():
+            min_val = depth_normalized[valid_mask].min()
+            max_val = depth_normalized[valid_mask].max()
+            depth_normalized = np.where(valid_mask, 
+                                       (depth_normalized - min_val) / (max_val - min_val + 1e-6) * 255, 
+                                       0)
+        else:
+            depth_normalized = np.zeros_like(depth_normalized)
+    
+    depth_normalized = depth_normalized.astype(np.uint8)
+    color_map = cv2.applyColorMap(depth_normalized, colormap)
+    cv2.imwrite(str(save_path), color_map)
+    return color_map

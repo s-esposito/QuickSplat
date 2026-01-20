@@ -32,7 +32,7 @@ from models.scaffold_gs import (
 from modules.rasterizer_3d import Camera
 
 from utils.rich_utils import CONSOLE
-from utils.depth import depth_loss, log_depth_loss, compute_full_depth_metrics, save_depth_opencv
+from utils.depth import depth_loss, log_depth_loss, compute_full_depth_metrics, save_depth_opencv, save_depth_visualization
 from utils.utils import TimerContext
 
 
@@ -1035,6 +1035,15 @@ class QuickSplatTrainer(BaseTrainer):
                         depth_combined = render_outputs["depth_expected"]
                     if save_depth_out:
                         save_depth_opencv(depth_combined, save_depth_path)
+                        
+                        # Save visualized depth with colormap
+                        depth_vis_dir = save_path.parent / "depth_vis"
+                        depth_vis_dir.mkdir(parents=True, exist_ok=True)
+                        if save_file_suffix == "":
+                            save_depth_vis_path = depth_vis_dir / f"{scene_id}_{batch_idx:04d}_depth_vis.jpg"
+                        else:
+                            save_depth_vis_path = depth_vis_dir / f"{scene_id}_{batch_idx:04d}_{save_file_suffix}_depth_vis.jpg"
+                        save_depth_visualization(depth_combined, save_depth_vis_path)
 
             metrics_dict = {
                 "l1_loss": l1_loss.item(),

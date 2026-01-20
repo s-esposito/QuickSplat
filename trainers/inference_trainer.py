@@ -18,7 +18,7 @@ from modules.rasterizer_2d import Full2DGSRasterizer
 from modules.gaussian_2d import Gaussian2DModel
 from modules.rasterizer_3d import Camera
 
-from utils.depth import compute_full_depth_metrics, save_depth_opencv
+from utils.depth import compute_full_depth_metrics, save_depth_opencv, save_depth_visualization
 from utils.rich_utils import CONSOLE
 from utils.metrics import Timer
 from utils.sparse import xyz_list_to_bxyz, chamfer_dist_with_crop, chamfer_dist_mesh_with_crop
@@ -790,6 +790,12 @@ class InferenceTrainer(Phase2Trainer):
                 save_depth_path = save_path / f"{scene_id}_{batch_idx:04d}_ft_depth.jpg"
                 depth_combined = torch.cat([batch["depth"], outputs["depth_expected"]], dim=-1)
                 save_depth_opencv(depth_combined, save_depth_path)
+                
+                # Save visualized depth with colormap
+                depth_vis_dir = self.output_dir / "outputs" / scene_id / "depth_vis"
+                depth_vis_dir.mkdir(parents=True, exist_ok=True)
+                save_depth_vis_path = depth_vis_dir / f"{scene_id}_{batch_idx:04d}_ft_depth_vis.jpg"
+                save_depth_visualization(depth_combined, save_depth_vis_path)
 
         metrics_dict = {}
         for k, v in metrics_list[0].items():
