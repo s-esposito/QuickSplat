@@ -1,0 +1,1 @@
+export CUDA_VER=11.8 ; export CUDA_HOME=/usr/local/cuda-$CUDA_VER ; export CUDA_PATH=/usr/local/cuda-$CUDA_VER ; export PATH=/usr/local/cuda-$CUDA_VER/bin:$PATH ; export LD_LIBRARY_PATH=/usr/local/cuda-$CUDA_VER/lib64:/usr/local/cuda-$CUDA_VER/extras/CUPTI/lib64:$LD_LIBRARY_PATH

@@ -1,6 +1,8 @@
 import argparse
 import random
 from datetime import timedelta
+from pathlib import Path
+import shutil
 
 import numpy as np
 import torch
@@ -38,18 +40,34 @@ def main():
     config.merge_from_file(args.config)
     config.merge_from_list(args.opts)
 
+    # Extract config filename without extension to use as directory name
+    config_path = Path(args.config)
+    config_name = config_path.stem  # Gets filename without extension
+    
+    # Use config name as the subname for output directory
+    config.subname = config_name
+    
     config.log_dir = args.out
     config.save_dir = args.out
     config.do_logging = False
 
     config.freeze()
     _set_random_seed(config.MACHINE.seed)
+    
     trainer = InferenceTrainer(
         config,
         ckpt_path=args.ckpt,
         local_rank=0,
         world_size=1,
     )
+    
+    # Copy config file to output directory
+    output_dir = Path(config.save_dir) / config.name / config.subname
+    output_dir.mkdir(parents=True, exist_ok=True)
+    config_dest = output_dir / config_path.name
+    shutil.copy2(args.config, config_dest)
+    print(f"Copied config file to: {config_dest}")
+    
     trainer.train()
 
 

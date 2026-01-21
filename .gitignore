@@ -220,3 +220,4 @@ quicksplat_spp_data_processed/*
 
 checkpoints.zip
 MinkowskiEngine/
+inference_outputs/

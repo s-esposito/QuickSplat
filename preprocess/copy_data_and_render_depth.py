@@ -111,10 +111,6 @@ def render_depth_maps(
     depth_dir = Path(output_root) / "data" / scene_id / "depth"
     depth_dir.mkdir(parents=True, exist_ok=True)
     
-    # Create depth_vis directory for visualizations
-    depth_vis_dir = Path(output_root) / "data" / scene_id / "depth_vis"
-    depth_vis_dir.mkdir(parents=True, exist_ok=True)
-    
     for image_id, image in tqdm(images.items(), "Rendering images"):
         if image.name not in image_name_to_transform:
             continue
@@ -170,7 +166,7 @@ def render_depth_maps(
         
         depth_normalized = depth_normalized.astype(np.uint8)
         depth_colormap = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_VIRIDIS)
-        cv2.imwrite(str(depth_vis_dir / depth_vis_name), depth_colormap)
+        cv2.imwrite(str(depth_dir / depth_vis_name), depth_colormap)
 
 
 def build_symlinks(

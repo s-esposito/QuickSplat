@@ -1036,13 +1036,11 @@ class QuickSplatTrainer(BaseTrainer):
                     if save_depth_out:
                         save_depth_opencv(depth_combined, save_depth_path)
                         
-                        # Save visualized depth with colormap
-                        depth_vis_dir = save_path.parent / "depth_vis"
-                        depth_vis_dir.mkdir(parents=True, exist_ok=True)
+                        # Save visualized depth with colormap in the same folder
                         if save_file_suffix == "":
-                            save_depth_vis_path = depth_vis_dir / f"{scene_id}_{batch_idx:04d}_depth_vis.jpg"
+                            save_depth_vis_path = save_path / f"{scene_id}_{batch_idx:04d}_depth_vis.jpg"
                         else:
-                            save_depth_vis_path = depth_vis_dir / f"{scene_id}_{batch_idx:04d}_{save_file_suffix}_depth_vis.jpg"
+                            save_depth_vis_path = save_path / f"{scene_id}_{batch_idx:04d}_{save_file_suffix}_depth_vis.jpg"
                         save_depth_visualization(depth_combined, save_depth_vis_path)
 
             metrics_dict = {

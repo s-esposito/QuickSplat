@@ -244,10 +244,11 @@ class InferenceTrainer(Phase2Trainer):
 
             with self.all_timer.pause_context():
                 # Pause during evaluation
+                # Save initial renders
                 init_metrics = self.evaluate_gs(
                     scaffold=scaffold,
                     scene_id=scene_id,
-                    save_path=None,
+                    save_path=save_dir / scene_id,
                     save_file_suffix="init",
                     use_identity=False,
                 )
@@ -281,10 +282,13 @@ class InferenceTrainer(Phase2Trainer):
 
                 with self.all_timer.pause_context():
                     # Pause during evaluation
+                    # Save renders at each optimization step with step suffix
+                    step_suffix = f"opt_{inner_step_idx + 1}"
                     eval_metrics = self.evaluate_gs(
                         scaffold=scaffold,
                         scene_id=scene_id,
                         save_path=save_dir / scene_id,
+                        save_file_suffix=step_suffix,
                     )
                     # Average over all the frames
                     eval_metrics = {x: np.mean([m[x] for m in eval_metrics]) for x in eval_metrics[0].keys()}
@@ -353,6 +357,47 @@ class InferenceTrainer(Phase2Trainer):
             },
             "average": {},
         }
+        
+        # First, add timing information for each scene
+        for scene_id, scene_history in all_scene_history.items():
+            time_init = scene_history[0]["time"]
+            time_opt = {}
+            for step_idx in range(1, self.num_inner_steps + 1):
+                if step_idx < len(scene_history) and not scene_history[step_idx].get("is_finetune", False):
+                    time_opt[f"opt_{step_idx}"] = scene_history[step_idx]["time"]
+            time_ft = scene_history[-1]["time"]
+            
+            output_summary["per_scene"][scene_id]["time"] = {
+                "init": time_init,
+                **time_opt,
+                "ft": time_ft,
+            }
+        
+        # Calculate average times
+        avg_time_init = 0.0
+        avg_time_opt = {}
+        avg_time_ft = 0.0
+        for scene_id, scene_history in all_scene_history.items():
+            avg_time_init += scene_history[0]["time"]
+            for step_idx in range(1, self.num_inner_steps + 1):
+                if step_idx < len(scene_history) and not scene_history[step_idx].get("is_finetune", False):
+                    opt_key = f"opt_{step_idx}"
+                    if opt_key not in avg_time_opt:
+                        avg_time_opt[opt_key] = 0.0
+                    avg_time_opt[opt_key] += scene_history[step_idx]["time"]
+            avg_time_ft += scene_history[-1]["time"]
+        
+        avg_time_init /= len(all_scene_history)
+        for opt_key in avg_time_opt:
+            avg_time_opt[opt_key] /= len(all_scene_history)
+        avg_time_ft /= len(all_scene_history)
+        
+        output_summary["average"]["time"] = {
+            "init": avg_time_init,
+            **avg_time_opt,
+            "ft": avg_time_ft,
+        }
+        
         metric_names = [
             "psnr",
             "lpips",
@@ -368,28 +413,51 @@ class InferenceTrainer(Phase2Trainer):
         ]
         for metric_name in metric_names:
             avg_val_init = 0.0
-            avg_val_opt = 0.0
+            avg_val_opt = {}  # Dictionary to store metrics for each opt step
             avg_val_ft = 0.0
+            
             for scene_id, scene_history in all_scene_history.items():
                 val_init = scene_history[0]["metrics"][metric_name]
-                val_opt = scene_history[self.num_inner_steps]["metrics"][metric_name]
+                
+                # Collect metrics from all optimization steps (excluding init and finetune)
+                opt_values = {}
+                for step_idx in range(1, self.num_inner_steps + 1):
+                    if step_idx < len(scene_history) and not scene_history[step_idx].get("is_finetune", False):
+                        opt_values[f"opt_{step_idx}"] = scene_history[step_idx]["metrics"][metric_name]
+                
                 val_ft = scene_history[-1]["metrics"][metric_name]
-                output_summary["per_scene"][scene_id][metric_name] = {
+                
+                # Build per-scene entry with all opt steps
+                scene_entry = {
                     "init": val_init,
-                    "opt": val_opt,
+                    **opt_values,
                     "ft": val_ft,
                 }
+                output_summary["per_scene"][scene_id][metric_name] = scene_entry
+                
                 avg_val_init += val_init
-                avg_val_opt += val_opt
+                # Accumulate opt values
+                for opt_key, opt_val in opt_values.items():
+                    if opt_key not in avg_val_opt:
+                        avg_val_opt[opt_key] = 0.0
+                    avg_val_opt[opt_key] += opt_val
                 avg_val_ft += val_ft
+                
             avg_val_ft /= len(all_scene_history)
             avg_val_init /= len(all_scene_history)
-            avg_val_opt /= len(all_scene_history)
-            CONSOLE.print(f"Metric: {metric_name}, Init: {avg_val_init:.3f}, Opt: {avg_val_opt:.3f}, FT: {avg_val_ft:.3f}")
+            # Average opt values
+            for opt_key in avg_val_opt:
+                avg_val_opt[opt_key] /= len(all_scene_history)
+            
+            # Log the final opt step for comparison
+            final_opt_key = f"opt_{self.num_inner_steps}"
+            final_opt_val = avg_val_opt.get(final_opt_key, 0.0)
+            CONSOLE.print(f"Metric: {metric_name}, Init: {avg_val_init:.3f}, Opt: {final_opt_val:.3f}, FT: {avg_val_ft:.3f}")
 
+            # Build average entry with all opt steps
             output_summary["average"][metric_name] = {
                 "init": avg_val_init,
-                "opt": avg_val_opt,
+                **avg_val_opt,
                 "ft": avg_val_ft,
             }
         with open(self.output_dir / "test_summary.json", "w") as f:
@@ -791,10 +859,8 @@ class InferenceTrainer(Phase2Trainer):
                 depth_combined = torch.cat([batch["depth"], outputs["depth_expected"]], dim=-1)
                 save_depth_opencv(depth_combined, save_depth_path)
                 
-                # Save visualized depth with colormap
-                depth_vis_dir = self.output_dir / "outputs" / scene_id / "depth_vis"
-                depth_vis_dir.mkdir(parents=True, exist_ok=True)
-                save_depth_vis_path = depth_vis_dir / f"{scene_id}_{batch_idx:04d}_ft_depth_vis.jpg"
+                # Save visualized depth with colormap in same folder
+                save_depth_vis_path = save_path / f"{scene_id}_{batch_idx:04d}_ft_depth_vis.jpg"
                 save_depth_visualization(depth_combined, save_depth_vis_path)
 
         metrics_dict = {}
