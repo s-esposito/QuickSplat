@@ -276,7 +276,7 @@ class ScaffoldGSFull(nn.Module):
 
         if is_2dgs:
             latent[:, :3] = xyz_offset
-            latent[:, 3:5] = scales     # only use two scale dimensions
+            latent[:, 3:5] = scales[:, :2]     # only use two scale dimensions
             latent[:, 5:9] = rots
             latent[:, 9:10] = opacities
             latent[:, 10:13] = rgb

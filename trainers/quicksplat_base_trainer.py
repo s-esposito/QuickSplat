@@ -18,6 +18,7 @@ from PIL import Image
 
 from trainers.base_trainer import BaseTrainer
 from dataset.scannetpp import ScannetppDataset, MultiScannetppDataset, MultiScannetppPointDataset
+from dataset.colmap_dataset import ColmapDataset
 from dataset.utils import RepeatSampler
 
 from models.scaffold_gs import (
@@ -32,7 +33,7 @@ from models.scaffold_gs import (
 from modules.rasterizer_3d import Camera
 
 from utils.rich_utils import CONSOLE
-from utils.depth import depth_loss, log_depth_loss, compute_full_depth_metrics, save_depth_opencv, save_depth_visualization
+from utils.depth import depth_loss, log_depth_loss, compute_full_depth_metrics, save_depth_visualization
 from utils.utils import TimerContext
 
 
@@ -129,16 +130,28 @@ class QuickSplatTrainer(BaseTrainer):
         )
 
     def get_inner_dataset(self, scene_id, fixed=False):
-        inner_train_dataset = ScannetppDataset(
-            self.config.DATASET.source_path,
-            self.config.DATASET.ply_path,
-            scene_id=scene_id,
-            split="train",
-            # downsample=self.config.MODEL.OPT.inner_downsample,
-            downsample=self.config.DATASET.image_downsample,
-            num_train_frames=self.config.DATASET.num_train_frames,
-            subsample_randomness=not fixed,
-        )
+        if self.config.DATASET.data_format == "colmap":
+            inner_train_dataset = ColmapDataset(
+                source_path=self.config.DATASET.source_path,
+                scene_id=scene_id,
+                split="train",
+                views_split=self.views_split_data[scene_id],
+                image_dir=self.config.DATASET.image_dir,
+                downsample=self.config.DATASET.image_downsample,
+                num_train_frames=self.config.DATASET.num_train_frames,
+                subsample_randomness=not fixed,
+            )
+        else:
+            inner_train_dataset = ScannetppDataset(
+                self.config.DATASET.source_path,
+                self.config.DATASET.ply_path,
+                scene_id=scene_id,
+                split="train",
+                # downsample=self.config.MODEL.OPT.inner_downsample,
+                downsample=self.config.DATASET.image_downsample,
+                num_train_frames=self.config.DATASET.num_train_frames,
+                subsample_randomness=not fixed,
+            )
 
         inner_train_loader = DataLoader(
             inner_train_dataset,
@@ -921,15 +934,27 @@ class QuickSplatTrainer(BaseTrainer):
         use_identity: bool = False,
     ) -> List[Dict[str, float]]:
         """Compute the validation metrics"""
-        dataset = ScannetppDataset(
-            self.config.DATASET.source_path,
-            self.config.DATASET.ply_path,
-            scene_id=scene_id,
-            split="val",
-            downsample=self.config.DATASET.image_downsample,
-            load_depth=True,
-            subsample_randomness=False,
-        )
+        if self.config.DATASET.data_format == "colmap":
+            dataset = ColmapDataset(
+                source_path=self.config.DATASET.source_path,
+                scene_id=scene_id,
+                split="val",
+                views_split=self.views_split_data[scene_id],
+                image_dir=self.config.DATASET.image_dir,
+                downsample=self.config.DATASET.image_downsample,
+                load_depth=True,
+                subsample_randomness=False,
+            )
+        else:
+            dataset = ScannetppDataset(
+                self.config.DATASET.source_path,
+                self.config.DATASET.ply_path,
+                scene_id=scene_id,
+                split="val",
+                downsample=self.config.DATASET.image_downsample,
+                load_depth=True,
+                subsample_randomness=False,
+            )
 
         val_loader = DataLoader(
             dataset,
@@ -1034,14 +1059,7 @@ class QuickSplatTrainer(BaseTrainer):
                     else:
                         depth_combined = render_outputs["depth_expected"]
                     if save_depth_out:
-                        save_depth_opencv(depth_combined, save_depth_path)
-                        
-                        # Save visualized depth with colormap in the same folder
-                        if save_file_suffix == "":
-                            save_depth_vis_path = save_path / f"{scene_id}_{batch_idx:04d}_depth_vis.jpg"
-                        else:
-                            save_depth_vis_path = save_path / f"{scene_id}_{batch_idx:04d}_{save_file_suffix}_depth_vis.jpg"
-                        save_depth_visualization(depth_combined, save_depth_vis_path)
+                        save_depth_visualization(depth_combined, save_depth_path)
 
             metrics_dict = {
                 "l1_loss": l1_loss.item(),

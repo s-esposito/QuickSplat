@@ -21,6 +21,8 @@ def parse_args():
     parser.add_argument("--config", type=str, required=True, help="Path to config file")
     parser.add_argument("--ckpt", type=str, required=True, help="Path to checkpoint file")
     parser.add_argument("--out", type=str, required=True, help="Path to output folder")
+    parser.add_argument("--one-shot", action="store_true", help="Only run on the first scene of the test split")
+    parser.add_argument("--skip-mesh", action="store_true", help="Skip mesh evaluation (TSDF fusion + chamfer) for faster inference")
     # Other arguments (any input) that will be later merged into yacs config
     parser.add_argument("opts", default=None, nargs=argparse.REMAINDER, help="Modify config options using the command-line")
     return parser.parse_args()
@@ -60,6 +62,10 @@ def main():
         local_rank=0,
         world_size=1,
     )
+
+    # Only run on the first scene if --one-shot is specified
+    if args.one_shot:
+        trainer.test_dataset.scene_list = trainer.test_dataset.scene_list[:1]
     
     # Copy config file to output directory
     output_dir = Path(config.save_dir) / config.name / config.subname
@@ -68,7 +74,7 @@ def main():
     shutil.copy2(args.config, config_dest)
     print(f"Copied config file to: {config_dest}")
     
-    trainer.train()
+    trainer.train(skip_mesh=args.skip_mesh)
 
 
 if __name__ == "__main__":

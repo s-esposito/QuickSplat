@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 from PIL import Image
 
 from dataset.scannetpp import ScannetppDataset, MultiScannetppPointDataset
+from dataset.colmap_dataset import ColmapDataset, ColmapPointDataset
 from dataset.cache_loader import GPUCacheLoader
 from trainers.phase2_trainer import Phase2Trainer
 from models.scaffold_gs import ScaffoldGSFull
@@ -18,11 +19,12 @@ from modules.rasterizer_2d import Full2DGSRasterizer
 from modules.gaussian_2d import Gaussian2DModel
 from modules.rasterizer_3d import Camera
 
-from utils.depth import compute_full_depth_metrics, save_depth_opencv, save_depth_visualization
+from utils.depth import compute_full_depth_metrics, save_depth_visualization
 from utils.rich_utils import CONSOLE
 from utils.metrics import Timer
 from utils.sparse import xyz_list_to_bxyz, chamfer_dist_with_crop, chamfer_dist_mesh_with_crop
 from utils.fusion import MeshExtractor
+from create_optimization_gifs import create_scene_videos
 
 
 # This voxel size is used for volumetric fusion during evaluation. Don't have to be the same as training voxel size.
@@ -38,14 +40,22 @@ class InferenceTrainer(Phase2Trainer):
         pass
 
     def setup_dataloader(self):
-        self.test_dataset = MultiScannetppPointDataset(
-            self.config.DATASET.source_path,
-            self.config.DATASET.ply_path,
-            self.config.DATASET.gt_ply_path,
-            # Use test_split for inference and evaluation
-            self.config.DATASET.test_split_path,
-            voxel_size=self.config.MODEL.SCAFFOLD.voxel_size,
-        )
+        if self.config.DATASET.data_format == "colmap":
+            self.views_split_data = json.load(open(self.config.DATASET.views_split_path))
+            self.test_dataset = ColmapPointDataset(
+                source_path=self.config.DATASET.source_path,
+                views_split_path=self.config.DATASET.views_split_path,
+                voxel_size=self.config.MODEL.SCAFFOLD.voxel_size,
+            )
+        else:
+            self.test_dataset = MultiScannetppPointDataset(
+                self.config.DATASET.source_path,
+                self.config.DATASET.ply_path,
+                self.config.DATASET.gt_ply_path,
+                # Use test_split for inference and evaluation
+                self.config.DATASET.test_split_path,
+                voxel_size=self.config.MODEL.SCAFFOLD.voxel_size,
+            )
 
         # Make val_dataset the same as test_dataset so that that functions in Phase2Trainer would work
         self.val_dataset = self.test_dataset
@@ -97,16 +107,45 @@ class InferenceTrainer(Phase2Trainer):
         bbox = torch.from_numpy(bbox).float().to(self.device)
         bbox_voxel = torch.from_numpy(bbox_voxel).int().to(self.device)
 
-        scaffolds = self.init_scaffold_train_batch(
-            [xyz],
-            [rgb],
-            [xyz_voxel],
-            [voxel_to_world],
-            [bbox],
-            [bbox_voxel],
-            test_mode=test_mode,
-        )
-        return scaffolds[0]
+        if self.config.DATASET.data_format == "colmap":
+            # Skip the initializer for COLMAP data (e.g., DL3DV) — it was trained on
+            # ScanNetPP and doesn't generalize. Use COLMAP points directly with defaults.
+            max_pts = self.config.DATASET.eval_max_num_points
+            if xyz.shape[0] > max_pts:
+                indices = torch.randperm(xyz.shape[0])[:max_pts]
+                xyz = xyz[indices]
+                rgb = rgb[indices]
+                xyz_voxel = xyz_voxel[indices]
+                xyz_offset = xyz_offset[indices]
+
+            scaffold = ScaffoldGSFull.create_from_voxels2(
+                self.config.MODEL,
+                hidden_dim=self.config.MODEL.SCAFFOLD.hidden_dim,
+                voxel_size=self.config.MODEL.SCAFFOLD.voxel_size,
+                xyz=xyz,
+                rgb=rgb,
+                xyz_voxel=xyz_voxel,
+                xyz_offset=xyz_offset,
+                transform=voxel_to_world,
+                bbox=bbox,
+                spatial_lr_scale=1.0,
+                zero_latent=True,
+                is_2dgs=(self.config.MODEL.gaussian_type == "2d"),
+                unit_scale=self.config.MODEL.SCAFFOLD.unit_scale,
+                unit_scale_multiplier=self.config.MODEL.SCAFFOLD.unit_scale_multiplier,
+            )
+            return scaffold
+        else:
+            scaffolds = self.init_scaffold_train_batch(
+                [xyz],
+                [rgb],
+                [xyz_voxel],
+                [voxel_to_world],
+                [bbox],
+                [bbox_voxel],
+                test_mode=test_mode,
+            )
+            return scaffolds[0]
 
     def _single_iteration_with_densify(
         self,
@@ -220,7 +259,16 @@ class InferenceTrainer(Phase2Trainer):
         scaffold.set_raw_params({"latent": latent_new})
         return scaffold
 
-    def train(self):
+    def _empty_mesh_metrics(self):
+        return {
+            "num_vertices": 0,
+            "num_faces": 0,
+            "num_gt_points": 0,
+            "chamfer_bi": 0.0,
+            "chamfer_bi2": 0.0,
+        }
+
+    def train(self, skip_mesh: bool = False):
         self.model.eval()
         self.scaffold_decoder.eval()
         if self.config.MODEL.DENSIFIER.enable:
@@ -254,13 +302,16 @@ class InferenceTrainer(Phase2Trainer):
                 )
                 # Average over all the frames
                 init_metrics = {x: np.mean([m[x] for m in init_metrics]) for x in init_metrics[0].keys()}
-                mesh_metrics = self.evaluate_mesh_and_save_scaffold(
-                    scene_id,
-                    scaffold,
-                    # Uncomment to save intermediate meshes
-                    # save_path=save_dir / f"{scene_id}_0.ply",
-                    depth_source="expected",
-                )
+                if skip_mesh:
+                    mesh_metrics = self._empty_mesh_metrics()
+                else:
+                    mesh_metrics = self.evaluate_mesh_and_save_scaffold(
+                        scene_id,
+                        scaffold,
+                        # Uncomment to save intermediate meshes
+                        # save_path=save_dir / f"{scene_id}_0.ply",
+                        depth_source="expected",
+                    )
                 init_metrics.update(mesh_metrics)
                 scene_history.append({
                     "scene_id": scene_id,
@@ -301,13 +352,16 @@ class InferenceTrainer(Phase2Trainer):
                         "time": self.all_timer.current(),
                     }
 
-                    mesh_metrics = self.evaluate_mesh_and_save_scaffold(
-                        scene_id,
-                        scaffold,
-                        # Uncomment to save intermediate meshes
-                        # save_path=save_dir / f"{scene_id}_{inner_step_idx + 1}.ply",
-                        depth_source="expected",
-                    )
+                    if skip_mesh:
+                        mesh_metrics = self._empty_mesh_metrics()
+                    else:
+                        mesh_metrics = self.evaluate_mesh_and_save_scaffold(
+                            scene_id,
+                            scaffold,
+                            # Uncomment to save intermediate meshes
+                            # save_path=save_dir / f"{scene_id}_{inner_step_idx + 1}.ply",
+                            depth_source="expected",
+                        )
                     eval_metrics.update(mesh_metrics)
 
                     scene_history.append({
@@ -325,26 +379,60 @@ class InferenceTrainer(Phase2Trainer):
             torch.cuda.empty_cache()
 
             # Per-scene optimization using 2DGS
-            finetune_history = self.finetune(scene_id, scaffold)
-            scene_history.extend(finetune_history)
+            if self.config.TRAIN.num_iterations > 0:
+                finetune_history = self.finetune(scene_id, scaffold, skip_mesh=skip_mesh)
+                scene_history.extend(finetune_history)
 
             # Visualize the metrics
             psnr_list = [m["metrics"]["psnr"] for m in scene_history]
-            chamfer_list = [m["metrics"]["chamfer_bi"] for m in scene_history]
-            time_list = [m["time"] for m in scene_history]
-            depth_loss_list = [m["metrics"]["depth_expected_l1"] for m in scene_history]
+            ssim_list = [m["metrics"].get("ssim", 0.0) for m in scene_history]
+            lpips_list = [m["metrics"].get("lpips", 0.0) for m in scene_history]
+            step_labels = []
+            for m in scene_history:
+                if m.get("is_finetune", False):
+                    step_labels.append(f"ft_{m['step']}")
+                else:
+                    step_labels.append(f"opt_{m['step']}" if m["step"] > 0 else "init")
+
             plt.clf()
             fig, axs = plt.subplots(1, 3, figsize=(15, 5))
-            axs[0].plot(time_list, psnr_list)
-            axs[0].set_xlabel("Time")
-            axs[0].set_ylabel("PSNR")
-            axs[1].plot(time_list, chamfer_list)
-            axs[1].set_xlabel("Time")
-            axs[1].set_ylabel("Chamfer Distance")
-            axs[2].plot(time_list, depth_loss_list)
-            axs[2].set_xlabel("Time")
-            axs[2].set_ylabel("Depth (expected)")
-            plt.savefig(self.output_dir / f"{scene_id}_test_metrics.png")
+            x = range(len(step_labels))
+
+            axs[0].plot(x, psnr_list, marker="o", markersize=4)
+            axs[0].set_ylabel("PSNR (dB)")
+            axs[0].set_title("PSNR")
+            axs[0].grid(True, alpha=0.3)
+
+            axs[1].plot(x, ssim_list, marker="o", markersize=4)
+            axs[1].set_ylabel("SSIM")
+            axs[1].set_title("SSIM")
+            axs[1].grid(True, alpha=0.3)
+
+            axs[2].plot(x, lpips_list, marker="o", markersize=4)
+            axs[2].set_ylabel("LPIPS")
+            axs[2].set_title("LPIPS")
+            axs[2].grid(True, alpha=0.3)
+
+            for ax in axs:
+                ax.set_xticks(list(x))
+                ax.set_xticklabels(step_labels, rotation=45, ha="right", fontsize=8)
+                ax.set_xlabel("Step")
+
+            fig.suptitle(f"Scene: {scene_id}", fontsize=12)
+            fig.tight_layout()
+            plt.savefig(self.output_dir / f"{scene_id}_test_metrics.png", dpi=150)
+            plt.close(fig)
+
+            # Create per-view optimization videos
+            include_ft = self.config.TRAIN.num_iterations > 0
+            create_scene_videos(
+                self.output_dir,
+                scene_id,
+                output_dir=self.output_dir / "videos",
+                fps=2,
+                include_ft=include_ft,
+            )
+
             all_scene_history[scene_id] = scene_history
 
             self.all_timer.reset()
@@ -449,16 +537,32 @@ class InferenceTrainer(Phase2Trainer):
             for opt_key in avg_val_opt:
                 avg_val_opt[opt_key] /= len(all_scene_history)
             
+            # Find best average value across all steps
+            higher_is_better = metric_name in ("psnr", "ssim", "depth_expected_delta1",
+                                                "depth_expected_accuracy_0.02", "depth_expected_accuracy_0.05",
+                                                "depth_expected_accuracy_0.1", "depth_expected_accuracy_0.2")
+            all_steps = {"init": avg_val_init, **avg_val_opt, "ft": avg_val_ft}
+            if higher_is_better:
+                best_step = max(all_steps, key=all_steps.get)
+            else:
+                best_step = min(all_steps, key=all_steps.get)
+            best_val = all_steps[best_step]
+
             # Log the final opt step for comparison
             final_opt_key = f"opt_{self.num_inner_steps}"
             final_opt_val = avg_val_opt.get(final_opt_key, 0.0)
-            CONSOLE.print(f"Metric: {metric_name}, Init: {avg_val_init:.3f}, Opt: {final_opt_val:.3f}, FT: {avg_val_ft:.3f}")
+            CONSOLE.print(
+                f"Metric: {metric_name}, Init: {avg_val_init:.3f}, Opt: {final_opt_val:.3f}, "
+                f"FT: {avg_val_ft:.3f}, Best: {best_val:.3f} @ {best_step}"
+            )
 
             # Build average entry with all opt steps
             output_summary["average"][metric_name] = {
                 "init": avg_val_init,
                 **avg_val_opt,
                 "ft": avg_val_ft,
+                "best": best_val,
+                "best_step": best_step,
             }
         with open(self.output_dir / "test_summary.json", "w") as f:
             json.dump(output_summary, f, indent=4)
@@ -499,15 +603,25 @@ class InferenceTrainer(Phase2Trainer):
         depth_trunc: float = 8.0,
     ):
         # xyz_gt, rgb = self.val_dataset.load_mesh_points(scene_id)
-        dataset = ScannetppDataset(
-            self.config.DATASET.source_path,
-            self.config.DATASET.gt_ply_path,
-            scene_id=scene_id,
-            split="train",
-            downsample=self.config.DATASET.image_downsample,
-            # num_train_frames=self.config.DATASET.num_train_frames,
-            # subsample_randomness=False,
-        )
+        if self.config.DATASET.data_format == "colmap":
+            dataset = ColmapDataset(
+                source_path=self.config.DATASET.source_path,
+                scene_id=scene_id,
+                split="train",
+                views_split=self.views_split_data[scene_id],
+                image_dir=self.config.DATASET.image_dir,
+                downsample=self.config.DATASET.image_downsample,
+            )
+        else:
+            dataset = ScannetppDataset(
+                self.config.DATASET.source_path,
+                self.config.DATASET.gt_ply_path,
+                scene_id=scene_id,
+                split="train",
+                downsample=self.config.DATASET.image_downsample,
+                # num_train_frames=self.config.DATASET.num_train_frames,
+                # subsample_randomness=False,
+            )
         xyz_gt, rgb = dataset.load_points()
         verts, faces = self.mesh_extractor.reconstruct_and_save(
             dataset,
@@ -550,18 +664,28 @@ class InferenceTrainer(Phase2Trainer):
             "chamfer_bi2": chamfer_bi2_mesh.item(),
         }
 
-    def finetune(self, scene_id, scaffold):
+    def finetune(self, scene_id, scaffold, skip_mesh: bool = False):
         assert self.config.MODEL.gaussian_type == "2d", "Only 2DGS finetuning is supported"
         finetune_history = []
 
         # Create the dataset
-        train_dataset = ScannetppDataset(
-            self.config.DATASET.source_path,
-            self.config.DATASET.ply_path,
-            scene_id=scene_id,
-            split="train",
-            downsample=self.config.DATASET.image_downsample,
-        )
+        if self.config.DATASET.data_format == "colmap":
+            train_dataset = ColmapDataset(
+                source_path=self.config.DATASET.source_path,
+                scene_id=scene_id,
+                split="train",
+                views_split=self.views_split_data[scene_id],
+                image_dir=self.config.DATASET.image_dir,
+                downsample=self.config.DATASET.image_downsample,
+            )
+        else:
+            train_dataset = ScannetppDataset(
+                self.config.DATASET.source_path,
+                self.config.DATASET.ply_path,
+                scene_id=scene_id,
+                split="train",
+                downsample=self.config.DATASET.image_downsample,
+            )
         if self.config.DATASET.cache_gpu:
             # Store all the data in GPU memory for faster access
             train_loader = GPUCacheLoader(
@@ -583,16 +707,28 @@ class InferenceTrainer(Phase2Trainer):
             )
         train_iter = iter(train_loader)
 
-        val_dataset = ScannetppDataset(
-            self.config.DATASET.source_path,
-            self.config.DATASET.ply_path,
-            scene_id=scene_id,
-            split="val",
-            # white_background=True,
-            downsample=self.config.DATASET.image_downsample,
-            subsample_randomness=False,
-            load_depth=True,
-        )
+        if self.config.DATASET.data_format == "colmap":
+            val_dataset = ColmapDataset(
+                source_path=self.config.DATASET.source_path,
+                scene_id=scene_id,
+                split="val",
+                views_split=self.views_split_data[scene_id],
+                image_dir=self.config.DATASET.image_dir,
+                downsample=self.config.DATASET.image_downsample,
+                subsample_randomness=False,
+                load_depth=True,
+            )
+        else:
+            val_dataset = ScannetppDataset(
+                self.config.DATASET.source_path,
+                self.config.DATASET.ply_path,
+                scene_id=scene_id,
+                split="val",
+                # white_background=True,
+                downsample=self.config.DATASET.image_downsample,
+                subsample_randomness=False,
+                load_depth=True,
+            )
 
         val_loader = DataLoader(
             val_dataset,
@@ -657,7 +793,7 @@ class InferenceTrainer(Phase2Trainer):
             if step_idx % self.config.TRAIN.val_interval == 0:
                 with self.all_timer.pause_context():
                     # Do evaluation
-                    val_metrics = self.finetune_eval(gaussian_model, val_loader, rasterizer, scene_id, step_idx)
+                    val_metrics = self.finetune_eval(gaussian_model, val_loader, rasterizer, scene_id, step_idx, skip_mesh=skip_mesh)
                     finetune_history.append({
                         "step": step_idx,
                         "time": self.all_timer.current(),
@@ -700,7 +836,9 @@ class InferenceTrainer(Phase2Trainer):
 
         with self.all_timer.pause_context():
             # Evaluate the mesh
-            val_metrics = self.finetune_eval(gaussian_model, val_loader, rasterizer, scene_id, num_iterations)
+            val_metrics = self.finetune_eval(gaussian_model, val_loader, rasterizer, scene_id, num_iterations, skip_mesh=skip_mesh)
+
+        if not skip_mesh:
             gaussian_params = {
                 "xyz": gaussian_model.get_xyz,
                 "rgb": gaussian_model.get_rgb,
@@ -708,14 +846,13 @@ class InferenceTrainer(Phase2Trainer):
                 "rotation": gaussian_model.get_rotation,
                 "opacity": gaussian_model.get_opacity,
             }
-
-        # Don't pause timer at the end to include mesh extraction time
-        self.evaluate_mesh_and_save(
-            scene_id,
-            gaussian_params,
-            save_path=self.output_dir / "outputs" / f"{scene_id}_ft.ply",
-            depth_source="expected",
-        )
+            # Don't pause timer at the end to include mesh extraction time
+            self.evaluate_mesh_and_save(
+                scene_id,
+                gaussian_params,
+                save_path=self.output_dir / "outputs" / f"{scene_id}_ft.ply",
+                depth_source="expected",
+            )
         finetune_history.append({
             "step": num_iterations,
             "time": self.all_timer.current(),
@@ -793,6 +930,7 @@ class InferenceTrainer(Phase2Trainer):
         scene_id,
         step_idx: int,
         save_outputs: bool = False,
+        skip_mesh: bool = False,
     ) -> Dict[str, float]:
         metrics_list = []
         opacity = torch.mean(model.get_opacity).item()
@@ -855,32 +993,31 @@ class InferenceTrainer(Phase2Trainer):
                 image_combined = Image.fromarray(image_combined)
                 image_combined.save(save_rgb_path)
 
-                save_depth_path = save_path / f"{scene_id}_{batch_idx:04d}_ft_depth.jpg"
                 depth_combined = torch.cat([batch["depth"], outputs["depth_expected"]], dim=-1)
-                save_depth_opencv(depth_combined, save_depth_path)
-                
-                # Save visualized depth with colormap in same folder
-                save_depth_vis_path = save_path / f"{scene_id}_{batch_idx:04d}_ft_depth_vis.jpg"
-                save_depth_visualization(depth_combined, save_depth_vis_path)
+                save_depth_path = save_path / f"{scene_id}_{batch_idx:04d}_ft_depth.jpg"
+                save_depth_visualization(depth_combined, save_depth_path)
 
         metrics_dict = {}
         for k, v in metrics_list[0].items():
             metrics_dict[k] = np.mean([m[k] for m in metrics_list])
 
-        gaussian_params = {
-            "xyz": model.get_xyz,
-            "rgb": model.get_rgb,
-            "scale": model.get_scaling,
-            "rotation": model.get_rotation,
-            "opacity": model.get_opacity,
-        }
-        mesh_metrics = self.evaluate_mesh_and_save(
-            scene_id,
-            gaussian_params,
-            save_path=None,
-            # Save the intermediate mesh for visualization and debugging
-            depth_source="expected",
-        )
-        metrics_dict.update(mesh_metrics)
+        if skip_mesh:
+            metrics_dict.update(self._empty_mesh_metrics())
+        else:
+            gaussian_params = {
+                "xyz": model.get_xyz,
+                "rgb": model.get_rgb,
+                "scale": model.get_scaling,
+                "rotation": model.get_rotation,
+                "opacity": model.get_opacity,
+            }
+            mesh_metrics = self.evaluate_mesh_and_save(
+                scene_id,
+                gaussian_params,
+                save_path=None,
+                # Save the intermediate mesh for visualization and debugging
+                depth_source="expected",
+            )
+            metrics_dict.update(mesh_metrics)
 
         return metrics_dict

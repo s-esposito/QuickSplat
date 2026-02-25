@@ -38,6 +38,10 @@ _C.DATASET.transform_path = "TRANSFORM_PATH"    # Deprecated
 _C.DATASET.image_downsample = 2
 _C.DATASET.cache_gpu = False        # Speed up the training (for GS methods)
 
+_C.DATASET.data_format = "scannetpp"      # "scannetpp" or "colmap"
+_C.DATASET.image_dir = "images"           # Image subdirectory name per scene
+_C.DATASET.views_split_path = ""          # Path to views split JSON (required for colmap format)
+
 _C.DATASET.overide_scene_id = None
 _C.DATASET.num_views = 5
 _C.DATASET.num_neighbor_views = 5
